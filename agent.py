@@ -84,7 +84,7 @@ def date_codes(days_ahead):
     return [(today + timedelta(days=i)).strftime("%Y%m%d") for i in range(days_ahead)]
 
 
-def fetch_raw(date_code):
+def fetch_raw(date_code, retries=4):
     params = {
         "appCode": "MOBAND2",
         "appVersion": config.APP_VERSION_CODE,
@@ -98,9 +98,26 @@ def fetch_raw(date_code):
         "regionCode": config.REGION_CODE,
         "subRegion": config.REGION_CODE,
     }
-    resp = requests.get(BMS_URL, params=params, headers=bms_headers(), timeout=25)
-    resp.raise_for_status()
-    return resp.json()
+    # BMS sits behind Cloudflare, which intermittently bot-challenges the
+    # okhttp client with 403 (or rate-limits with 429). These are transient,
+    # so back off and retry rather than dropping the date.
+    last_exc = None
+    for attempt in range(retries):
+        resp = requests.get(BMS_URL, params=params, headers=bms_headers(), timeout=25)
+        if resp.status_code in (403, 429, 503):
+            last_exc = requests.HTTPError(
+                f"{resp.status_code} {resp.reason} (Cloudflare block)", response=resp)
+            # Honour Retry-After if present, else exponential backoff + jitter.
+            wait = resp.headers.get("Retry-After")
+            wait = float(wait) if (wait and wait.isdigit()) else (2 ** attempt)
+            wait += random.uniform(0, 1.0)
+            print(f"  ~ {resp.status_code} on {date_code}, retry "
+                  f"{attempt + 1}/{retries} in {wait:.1f}s", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise last_exc
 
 
 def _availability(showtime):
